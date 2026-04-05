@@ -73,7 +73,8 @@ openclaw onboard --non-interactive \
   --gateway-bind loopback \
   --install-daemon \
   --daemon-runtime node \
-  --skip-skills
+  --skip-skills \
+  --accept-risk
 ok "OpenClaw onboarding complete"
 
 OC_CONFIG="$HOME/.openclaw/openclaw.json"
