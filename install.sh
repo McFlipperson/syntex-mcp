@@ -34,16 +34,23 @@ ok "git, curl, build-essential installed"
 # ─── 2. NODE.JS 22 VIA NODESOURCE ────────────────────────────────────────────
 
 step "Installing Node.js 22 via NodeSource"
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash - -q
-apt-get install -y -q nodejs
-NODE_VER=$(node --version)
-ok "Node.js $NODE_VER installed"
+if node --version 2>/dev/null | grep -q '^v22\.'; then
+  ok "Node.js $(node --version) already installed — skipping"
+else
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - -q
+  apt-get install -y -q nodejs
+  ok "Node.js $(node --version) installed"
+fi
 
 # ─── 3. INSTALL OPENCLAW ──────────────────────────────────────────────────────
 
 step "Installing OpenClaw (--no-onboard)"
-curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard
-ok "OpenClaw installed"
+if command -v openclaw >/dev/null 2>&1; then
+  ok "OpenClaw already installed at $(command -v openclaw) — skipping"
+else
+  curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard
+  ok "OpenClaw installed"
+fi
 
 # Ensure OC binary is on PATH (installer may update .bashrc which is not sourced here)
 for candidate in \
@@ -61,24 +68,28 @@ command -v openclaw >/dev/null 2>&1 || die "openclaw binary not found after inst
 
 # ─── 4. OC NON-INTERACTIVE ONBOARDING ────────────────────────────────────────
 
-step "Running OpenClaw non-interactive onboarding"
-openclaw onboard --non-interactive \
-  --mode local \
-  --auth-choice custom-api-key \
-  --custom-base-url "https://syntexprotocol.com/v1" \
-  --custom-model-id "auto" \
-  --custom-api-key "$SX_TOKEN" \
-  --custom-compatibility openai \
-  --gateway-port 18789 \
-  --gateway-bind loopback \
-  --install-daemon \
-  --daemon-runtime node \
-  --skip-skills \
-  --accept-risk
-ok "OpenClaw onboarding complete"
-
 OC_CONFIG="$HOME/.openclaw/openclaw.json"
-[ -f "$OC_CONFIG" ] || die "OC config not created at $OC_CONFIG — onboarding may have failed"
+
+step "Running OpenClaw non-interactive onboarding"
+if [ -f "$OC_CONFIG" ]; then
+  ok "OC config already exists at $OC_CONFIG — skipping onboarding"
+else
+  openclaw onboard --non-interactive \
+    --mode local \
+    --auth-choice custom-api-key \
+    --custom-base-url "https://syntexprotocol.com/v1" \
+    --custom-model-id "auto" \
+    --custom-api-key "$SX_TOKEN" \
+    --custom-compatibility openai \
+    --gateway-port 18789 \
+    --gateway-bind loopback \
+    --install-daemon \
+    --daemon-runtime node \
+    --skip-skills \
+    --accept-risk
+  ok "OpenClaw onboarding complete"
+  [ -f "$OC_CONFIG" ] || die "OC config not created at $OC_CONFIG — onboarding may have failed"
+fi
 
 # ─── 4b. RANDOM PORT, TLS, NGINX PROXY, UFW ──────────────────────────────────
 #
@@ -88,34 +99,44 @@ OC_CONFIG="$HOME/.openclaw/openclaw.json"
 # nothing reaches the OC gateway without it. A self-signed TLS certificate
 # provides encryption in transit. Authentication is the SX token.
 
-# Pick a random unprivileged port that is not already in use.
-GATEWAY_PORT=""
-for _attempt in $(seq 1 20); do
-  _p=$(shuf -i 49152-65535 -n 1)
-  if ! ss -tlnp 2>/dev/null | grep -q ":${_p} "; then
-    GATEWAY_PORT="$_p"
-    break
-  fi
-done
-[ -n "$GATEWAY_PORT" ] || die "Could not find a free port in 49152-65535 after 20 attempts"
-
-step "Selected random OC gateway port: $GATEWAY_PORT"
-mkdir -p /etc/syntex
-echo "$GATEWAY_PORT" > /etc/syntex/gateway.port
+# Reuse the existing port if this server was already set up, otherwise pick a
+# new random unprivileged port. This is the key idempotency anchor for the whole
+# nginx/ufw/registration block — everything downstream depends on it being stable.
+if [ -f /etc/syntex/gateway.port ]; then
+  GATEWAY_PORT=$(cat /etc/syntex/gateway.port)
+  step "Reusing existing OC gateway port: $GATEWAY_PORT"
+else
+  GATEWAY_PORT=""
+  for _attempt in $(seq 1 20); do
+    _p=$(shuf -i 49152-65535 -n 1)
+    if ! ss -tlnp 2>/dev/null | grep -q ":${_p} "; then
+      GATEWAY_PORT="$_p"
+      break
+    fi
+  done
+  [ -n "$GATEWAY_PORT" ] || die "Could not find a free port in 49152-65535 after 20 attempts"
+  step "Selected random OC gateway port: $GATEWAY_PORT"
+  mkdir -p /etc/syntex
+  echo "$GATEWAY_PORT" > /etc/syntex/gateway.port
+fi
 
 step "Installing nginx, openssl, and ufw"
 apt-get install -y -q nginx openssl ufw
 ok "nginx, openssl, ufw installed"
 
 step "Generating self-signed TLS certificate"
-mkdir -p /etc/nginx/ssl/syntex
-openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-  -keyout /etc/nginx/ssl/syntex/oc.key \
-  -out    /etc/nginx/ssl/syntex/oc.crt \
-  -subj   "/CN=syntex-oc/O=Syntex/C=AU" \
-  2>/dev/null
-chmod 600 /etc/nginx/ssl/syntex/oc.key
-ok "Self-signed TLS cert at /etc/nginx/ssl/syntex/"
+if [ -f /etc/nginx/ssl/syntex/oc.crt ] && [ -f /etc/nginx/ssl/syntex/oc.key ]; then
+  ok "TLS cert already exists at /etc/nginx/ssl/syntex/ — skipping generation"
+else
+  mkdir -p /etc/nginx/ssl/syntex
+  openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout /etc/nginx/ssl/syntex/oc.key \
+    -out    /etc/nginx/ssl/syntex/oc.crt \
+    -subj   "/CN=syntex-oc/O=Syntex/C=AU" \
+    2>/dev/null
+  chmod 600 /etc/nginx/ssl/syntex/oc.key
+  ok "Self-signed TLS cert at /etc/nginx/ssl/syntex/"
+fi
 
 step "Configuring nginx HTTPS reverse proxy on port $GATEWAY_PORT"
 # Note: bash variables ($GATEWAY_PORT, $SX_TOKEN) are expanded here.
