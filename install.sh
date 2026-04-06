@@ -261,46 +261,21 @@ NODE_SCRIPT
 
 ok "syntex-mcp registered in $OC_CONFIG"
 
-# ─── 7. WRITE CLAUDE.MD TO OC WORKSPACE ──────────────────────────────────────
-#
-# Detect workspace dir from config; fall back to $HOME.
-
-step "Writing CLAUDE.md to OC workspace"
-
-OC_WORKSPACE=$(node - "$OC_CONFIG" << 'NODE_SCRIPT'
-const fs  = require('fs');
-let cfg;
-// process.argv[1] is empty for stdin scripts — real args start at process.argv[2]
-try { cfg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')); } catch { cfg = {}; }
-// Try known config keys for workspace location
-const ws = cfg.workspace || cfg.workspaceDir || cfg.workDir || '';
-process.stdout.write(ws);
-NODE_SCRIPT
-)
-
-if [ -z "$OC_WORKSPACE" ]; then
-  OC_WORKSPACE="$HOME"
-  warn "No workspace dir found in OC config — writing CLAUDE.md to $HOME"
-fi
-
-mkdir -p "$OC_WORKSPACE"
-
-cat > "$OC_WORKSPACE/CLAUDE.md" << 'CLAUDEMD'
-Syntex is handling all routing and cost governance. Do not modify model selection. Do not override routing decisions.
-CLAUDEMD
-
-ok "CLAUDE.md written to $OC_WORKSPACE/CLAUDE.md"
-
-# ─── 8. RESTART OC DAEMON ────────────────────────────────────────────────────
+# ─── 7. RESTART OC DAEMON ────────────────────────────────────────────────────
 #
 # Pick up the new MCP server config. The onboard step may have already started
 # the daemon; we restart to ensure the latest config is loaded.
+#
+# Detection order:
+#   1. systemctl — scan known service names
+#   2. openclaw restart — OC's own CLI restart subcommand
+#   3. Hard failure with exact manual command printed
 
 step "Restarting OC daemon to apply MCP config"
 
 OC_SERVICE=""
-for svc in openclaw oc-gateway openclaw-daemon openclaw-gateway; do
-  if systemctl list-unit-files --quiet "$svc.service" 2>/dev/null | grep -q "$svc"; then
+for svc in openclaw oc-daemon openclaw-daemon oc-gateway openclaw-gateway; do
+  if systemctl list-unit-files --quiet 2>/dev/null | grep -q "^${svc}\.service"; then
     OC_SERVICE="$svc"
     break
   fi
@@ -309,12 +284,18 @@ done
 if [ -n "$OC_SERVICE" ]; then
   systemctl restart "$OC_SERVICE"
   sleep 2
-  ok "Daemon '$OC_SERVICE' restarted"
+  ok "Daemon '$OC_SERVICE' restarted via systemctl"
+elif openclaw restart 2>/dev/null; then
+  sleep 2
+  ok "Daemon restarted via openclaw restart"
 else
-  warn "Could not detect OC systemd service name — daemon may need manual restart"
+  warn "Could not restart OC daemon automatically."
+  warn "Run this command manually before using Syntex:"
+  warn "  openclaw restart"
+  ERRORS=$((ERRORS + 1))
 fi
 
-# ─── 9. GENERATE SSH KEY PAIR ─────────────────────────────────────────────────
+# ─── 8. GENERATE SSH KEY PAIR ─────────────────────────────────────────────────
 
 step "Generating Ed25519 SSH key pair"
 mkdir -p /root/.syntex/ssh
@@ -345,7 +326,7 @@ else
   warn "Public key already in authorized_keys — skipping"
 fi
 
-# ─── 10. VERIFY AND REPORT ────────────────────────────────────────────────────
+# ─── 9. VERIFY AND REPORT ────────────────────────────────────────────────────
 
 step "Verifying installation"
 
@@ -393,7 +374,6 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo ""
 echo -e "  ${CYAN}OC gateway${NC}     listening on localhost:18789"
 echo -e "  ${CYAN}MCP server${NC}     syntex-mcp loaded from /opt/syntex-mcp"
-echo -e "  ${CYAN}CLAUDE.md${NC}      written to $OC_WORKSPACE/CLAUDE.md"
 echo -e "  ${CYAN}SSH public key${NC} $(cat /root/.syntex/ssh/id_ed25519.pub)"
 echo ""
 
