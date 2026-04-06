@@ -36,8 +36,9 @@ import { fileURLToPath }         from 'url';
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 
-const SX_TOKEN        = process.env.SX_TOKEN || '';
-const OC_WORKING_DIR  = process.env.OC_WORKING_DIR || '';
+const SX_TOKEN        = process.env.SX_TOKEN        || '';
+const OC_WORKING_DIR  = process.env.OC_WORKING_DIR  || '';
+const SX_GATEWAY_PORT = process.env.SX_GATEWAY_PORT || '';
 const SYNTEX_BASE_URL = 'https://syntexprotocol.com';
 
 // ─── RISE TIER DETECTION ──────────────────────────────────────────────────────
@@ -366,6 +367,65 @@ function buildStructuredTask(soulLine, memoryFacts, task, prefs, tier) {
   ].join('\n');
 }
 
+// ─── STARTUP REGISTRATION HEARTBEAT ──────────────────────────────────────────
+//
+// OC's built-in heartbeat to Syntex fires on its own schedule (up to 30 min).
+// That's too long to wait during onboarding — the modal channel won't work until
+// Syntex has the gateway URL stored for this server.
+//
+// This fires immediately when the MCP server starts (i.e. when OC starts), then
+// retries every 60s until Syntex acknowledges the registration with a 200.
+// Once registered, polling stops — OC's normal task traffic keeps the URL fresh.
+//
+// Requires SX_GATEWAY_PORT in env (written by install.sh into the OC MCP config).
+
+async function sendRegistrationHeartbeat() {
+  if (!SX_TOKEN || !SX_GATEWAY_PORT) return false;
+  try {
+    const res = await fetch(`${SYNTEX_BASE_URL}/v1/chat/completions`, {
+      method:  'POST',
+      headers: {
+        'Authorization':     `Bearer ${SX_TOKEN}`,
+        'Content-Type':      'application/json',
+        'X-OC-Gateway-Port': SX_GATEWAY_PORT
+      },
+      body:   JSON.stringify({
+        model:    'syntex/auto',
+        messages: [{ role: 'user', content: 'ping' }],
+        stream:   false
+      }),
+      signal: AbortSignal.timeout(15000)
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function startRegistrationHeartbeat() {
+  if (!SX_TOKEN || !SX_GATEWAY_PORT) return;
+
+  (async () => {
+    // Immediate attempt on startup
+    if (await sendRegistrationHeartbeat()) {
+      console.error('[syntex-mcp] Gateway registered with Syntex');
+      return;
+    }
+
+    // Retry every 60s until acknowledged
+    console.error('[syntex-mcp] Registration heartbeat failed — retrying every 60s');
+    const interval = setInterval(async () => {
+      if (await sendRegistrationHeartbeat()) {
+        console.error('[syntex-mcp] Gateway registration confirmed');
+        clearInterval(interval);
+      }
+    }, 60_000);
+
+    // Don't hold the event loop open if OC shuts down the MCP process
+    interval.unref();
+  })().catch(err => console.error('[syntex-mcp] Registration heartbeat error:', err.message));
+}
+
 // ─── MCP SERVER ───────────────────────────────────────────────────────────────
 
 const server = new Server(
@@ -484,4 +544,5 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ─── CONNECT ──────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
+startRegistrationHeartbeat(); // non-blocking — fires immediately, retries until confirmed
 await server.connect(transport);
