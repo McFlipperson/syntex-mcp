@@ -36,9 +36,8 @@ import { fileURLToPath }         from 'url';
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
 
-const SX_TOKEN        = process.env.SX_TOKEN        || '';
-const OC_WORKING_DIR  = process.env.OC_WORKING_DIR  || '';
-const SX_GATEWAY_PORT = process.env.SX_GATEWAY_PORT || '';
+const SX_TOKEN        = process.env.SX_TOKEN       || '';
+const OC_WORKING_DIR  = process.env.OC_WORKING_DIR || '';
 const SYNTEX_BASE_URL = 'https://syntexprotocol.com';
 
 // ─── RISE TIER DETECTION ──────────────────────────────────────────────────────
@@ -367,63 +366,98 @@ function buildStructuredTask(soulLine, memoryFacts, task, prefs, tier) {
   ].join('\n');
 }
 
-// ─── STARTUP REGISTRATION HEARTBEAT ──────────────────────────────────────────
+// ─── TASK POLL LOOP ───────────────────────────────────────────────────────────
 //
-// OC's built-in heartbeat to Syntex fires on its own schedule (up to 30 min).
-// That's too long to wait during onboarding — the modal channel won't work until
-// Syntex has the gateway URL stored for this server.
+// Runs continuously from MCP startup. Long-polls Syntex for tasks queued by
+// the modal, executes each one inside OC via the CLI, then posts the result
+// back to Syntex which emits it to the user's SSE channel.
 //
-// This fires immediately when the MCP server starts (i.e. when OC starts), then
-// retries every 60s until Syntex acknowledges the registration with a 200.
-// Once registered, polling stops — OC's normal task traffic keeps the URL fresh.
-//
-// Requires SX_GATEWAY_PORT in env (written by install.sh into the OC MCP config).
+// Flow:
+//   GET /api/task/poll  — holds up to 30s; returns { taskId, task } or { task: null }
+//   execute via OC CLI  — openclaw run "<task>"
+//   POST /api/task/result — { taskId, result }
+//   reconnect immediately regardless of outcome
 
-async function sendRegistrationHeartbeat() {
-  if (!SX_TOKEN || !SX_GATEWAY_PORT) return false;
-  try {
-    const res = await fetch(`${SYNTEX_BASE_URL}/v1/chat/completions`, {
-      method:  'POST',
-      headers: {
-        'Authorization':     `Bearer ${SX_TOKEN}`,
-        'Content-Type':      'application/json',
-        'X-OC-Gateway-Port': SX_GATEWAY_PORT
-      },
-      body:   JSON.stringify({
-        model:    'syntex/auto',
-        messages: [{ role: 'user', content: 'ping' }],
-        stream:   false
-      }),
-      signal: AbortSignal.timeout(15000)
-    });
-    return res.ok;
-  } catch {
-    return false;
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+const execFileAsync = promisify(execFile);
+
+async function pollForTask() {
+  const res = await fetch(`${SYNTEX_BASE_URL}/api/task/poll`, {
+    method:  'GET',
+    headers: { 'Authorization': `Bearer ${SX_TOKEN}` },
+    // 35s — slightly longer than the server-side 30s hold so we don't race
+    signal:  AbortSignal.timeout(35_000)
+  });
+
+  if (!res.ok) {
+    throw new Error(`poll returned ${res.status}`);
+  }
+
+  return res.json(); // { taskId, task } | { task: null }
+}
+
+async function executeTask(task) {
+  // Submit to OC via CLI. OC runs the task as an agent (with full tool access,
+  // memory, multi-step reasoning) and returns the final output on stdout.
+  // Adjust the subcommand if OC's CLI uses a different verb (e.g. 'chat', 'exec').
+  const { stdout } = await execFileAsync('openclaw', ['run', task], {
+    timeout: 300_000  // 5 min ceiling — OC handles its own internal timeouts
+  });
+  return stdout.trim();
+}
+
+async function submitResult(taskId, result) {
+  const res = await fetch(`${SYNTEX_BASE_URL}/api/task/result`, {
+    method:  'POST',
+    headers: {
+      'Authorization': `Bearer ${SX_TOKEN}`,
+      'Content-Type':  'application/json'
+    },
+    body:   JSON.stringify({ taskId, result }),
+    signal: AbortSignal.timeout(15_000)
+  });
+
+  if (!res.ok) {
+    console.error(`[syntex-mcp] result submit failed: ${res.status}`);
   }
 }
 
-function startRegistrationHeartbeat() {
-  if (!SX_TOKEN || !SX_GATEWAY_PORT) return;
+async function taskPollLoop() {
+  if (!SX_TOKEN) {
+    console.error('[syntex-mcp] SX_TOKEN not set — task polling disabled');
+    return;
+  }
 
-  (async () => {
-    // Immediate attempt on startup
-    if (await sendRegistrationHeartbeat()) {
-      console.error('[syntex-mcp] Gateway registered with Syntex');
-      return;
-    }
+  console.error('[syntex-mcp] Task poll loop started');
 
-    // Retry every 60s until acknowledged
-    console.error('[syntex-mcp] Registration heartbeat failed — retrying every 60s');
-    const interval = setInterval(async () => {
-      if (await sendRegistrationHeartbeat()) {
-        console.error('[syntex-mcp] Gateway registration confirmed');
-        clearInterval(interval);
+  while (true) {
+    try {
+      const data = await pollForTask();
+
+      if (data.task) {
+        console.error(`[syntex-mcp] Task claimed (id=${data.taskId}): ${data.task.slice(0, 80)}`);
+        try {
+          const result = await executeTask(data.task);
+          await submitResult(data.taskId, result);
+          console.error(`[syntex-mcp] Task ${data.taskId} complete`);
+        } catch (execErr) {
+          console.error(`[syntex-mcp] Task ${data.taskId} execution failed: ${execErr.message}`);
+          // Submit the error as the result so the user sees something
+          await submitResult(data.taskId, `Error executing task: ${execErr.message}`).catch(() => {});
+        }
       }
-    }, 60_000);
+      // task: null means 30s elapsed with nothing — reconnect immediately
 
-    // Don't hold the event loop open if OC shuts down the MCP process
-    interval.unref();
-  })().catch(err => console.error('[syntex-mcp] Registration heartbeat error:', err.message));
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // Our own 35s timeout fired — server must have hung; reconnect
+        continue;
+      }
+      console.error(`[syntex-mcp] Poll error: ${err.message} — retrying in 5s`);
+      await new Promise(r => setTimeout(r, 5_000));
+    }
+  }
 }
 
 // ─── MCP SERVER ───────────────────────────────────────────────────────────────
@@ -544,5 +578,5 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ─── CONNECT ──────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
-startRegistrationHeartbeat(); // non-blocking — fires immediately, retries until confirmed
+taskPollLoop().catch(err => console.error('[syntex-mcp] Poll loop crashed:', err.message));
 await server.connect(transport);

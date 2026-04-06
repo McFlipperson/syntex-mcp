@@ -231,14 +231,13 @@ ok "npm install complete"
 
 step "Adding syntex-mcp to OC config"
 
-SX_TOKEN="$SX_TOKEN" SX_GATEWAY_PORT="$GATEWAY_PORT" node - "$OC_CONFIG" << 'NODE_SCRIPT'
+SX_TOKEN="$SX_TOKEN" node - "$OC_CONFIG" << 'NODE_SCRIPT'
 const fs = require('fs');
 
 // process.argv[1] is empty string when node reads from stdin (node -)
 // The first real argument is always at process.argv[2].
-const configPath  = process.argv[2];
-const token       = process.env.SX_TOKEN;
-const gatewayPort = process.env.SX_GATEWAY_PORT;
+const configPath = process.argv[2];
+const token      = process.env.SX_TOKEN;
 
 let config;
 try {
@@ -255,7 +254,7 @@ if (!config.mcp.servers)        config.mcp.servers = {};
 config.mcp.servers['syntex-mcp'] = {
   command: 'node',
   args:    ['/opt/syntex-mcp/src/index.js'],
-  env:     { SX_TOKEN: token, SX_GATEWAY_PORT: gatewayPort }
+  env:     { SX_TOKEN: token }
 };
 
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
