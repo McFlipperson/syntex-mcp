@@ -80,6 +80,102 @@ ok "OpenClaw onboarding complete"
 OC_CONFIG="$HOME/.openclaw/openclaw.json"
 [ -f "$OC_CONFIG" ] || die "OC config not created at $OC_CONFIG — onboarding may have failed"
 
+# ─── 4b. RANDOM PORT, TLS, NGINX PROXY, UFW ──────────────────────────────────
+#
+# The OC gateway listens on loopback:18789 only. To let Syntex reach it from
+# outside, we put an nginx HTTPS reverse proxy on a random high port in front
+# of it. nginx validates the SX token as Bearer auth on every inbound request —
+# nothing reaches the OC gateway without it. A self-signed TLS certificate
+# provides encryption in transit. Authentication is the SX token.
+
+# Pick a random unprivileged port that is not already in use.
+GATEWAY_PORT=""
+for _attempt in $(seq 1 20); do
+  _p=$(shuf -i 49152-65535 -n 1)
+  if ! ss -tlnp 2>/dev/null | grep -q ":${_p} "; then
+    GATEWAY_PORT="$_p"
+    break
+  fi
+done
+[ -n "$GATEWAY_PORT" ] || die "Could not find a free port in 49152-65535 after 20 attempts"
+
+step "Selected random OC gateway port: $GATEWAY_PORT"
+mkdir -p /etc/syntex
+echo "$GATEWAY_PORT" > /etc/syntex/gateway.port
+
+step "Installing nginx, openssl, and ufw"
+apt-get install -y -q nginx openssl ufw
+ok "nginx, openssl, ufw installed"
+
+step "Generating self-signed TLS certificate"
+mkdir -p /etc/nginx/ssl/syntex
+openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/syntex/oc.key \
+  -out    /etc/nginx/ssl/syntex/oc.crt \
+  -subj   "/CN=syntex-oc/O=Syntex/C=AU" \
+  2>/dev/null
+chmod 600 /etc/nginx/ssl/syntex/oc.key
+ok "Self-signed TLS cert at /etc/nginx/ssl/syntex/"
+
+step "Configuring nginx HTTPS reverse proxy on port $GATEWAY_PORT"
+# Note: bash variables ($GATEWAY_PORT, $SX_TOKEN) are expanded here.
+# nginx variables ($host, $remote_addr, etc.) are escaped with \ so bash
+# leaves them alone and nginx sees the literal $ at runtime.
+cat > /etc/nginx/sites-available/syntex-oc << NGINX_CONF
+server {
+    listen $GATEWAY_PORT ssl;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/ssl/syntex/oc.crt;
+    ssl_certificate_key /etc/nginx/ssl/syntex/oc.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    # Reject any request that does not carry the exact SX token as Bearer auth.
+    # Authentication is via the SX token. TLS provides encryption only.
+    if (\$http_authorization != "Bearer $SX_TOKEN") {
+        return 401;
+    }
+
+    location / {
+        proxy_pass         http://127.0.0.1:18789;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+    }
+}
+NGINX_CONF
+
+ln -sf /etc/nginx/sites-available/syntex-oc /etc/nginx/sites-enabled/syntex-oc
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx
+ok "nginx configured on port $GATEWAY_PORT"
+
+step "Configuring ufw firewall"
+# Allow SSH first so we cannot lock ourselves out.
+ufw allow 22/tcp             comment 'SSH'
+ufw allow "$GATEWAY_PORT/tcp" comment 'Syntex OC gateway HTTPS'
+# Explicitly deny external access to the raw OC gateway port (loopback only).
+ufw deny  18789/tcp          comment 'OC gateway loopback — deny external'
+ufw --force enable
+ok "ufw: port $GATEWAY_PORT open, port 18789 denied"
+
+step "Registering OC gateway with Syntex"
+# Send a heartbeat with the X-OC-Gateway-Port header so Syntex can store
+# https://[this-server-ip]:[port] as the gateway URL for the modal channel.
+curl -fsS -X POST https://syntexprotocol.com/v1/chat/completions \
+  -H "Authorization: Bearer $SX_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "X-OC-Gateway-Port: $GATEWAY_PORT" \
+  -d "{\"model\":\"syntex/auto\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"stream\":false}" \
+  --max-time 15 --output /dev/null \
+  || warn "Gateway registration request failed — Syntex will auto-register on first OC task"
+ok "OC gateway registered with Syntex"
+
 # ─── 5. CLONE AND INSTALL SYNTEX MCP ─────────────────────────────────────────
 
 step "Cloning syntex-mcp into /opt/syntex-mcp"
