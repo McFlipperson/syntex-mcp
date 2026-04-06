@@ -23,6 +23,8 @@ if [ "$SX_TOKEN" = "__SX_TOKEN__" ]; then
   die "SX_TOKEN was not replaced. Download this script from your Syntex dashboard, not from GitHub directly."
 fi
 
+ERRORS=0  # accumulated across all steps; reported at the end
+
 # ─── 1. SYSTEM DEPENDENCIES ───────────────────────────────────────────────────
 
 step "Updating apt and installing system dependencies"
@@ -188,14 +190,19 @@ ok "ufw: port $GATEWAY_PORT open, port 18789 denied"
 step "Registering OC gateway with Syntex"
 # Send a heartbeat with the X-OC-Gateway-Port header so Syntex can store
 # https://[this-server-ip]:[port] as the gateway URL for the modal channel.
-curl -fsS -X POST https://syntexprotocol.com/v1/chat/completions \
+REGISTRATION_HTTP=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X POST https://syntexprotocol.com/v1/chat/completions \
   -H "Authorization: Bearer $SX_TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-OC-Gateway-Port: $GATEWAY_PORT" \
   -d "{\"model\":\"syntex/auto\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"stream\":false}" \
-  --max-time 15 --output /dev/null \
-  || warn "Gateway registration request failed — Syntex will auto-register on first OC task"
-ok "OC gateway registered with Syntex"
+  --max-time 15)
+if [ "$REGISTRATION_HTTP" = "200" ]; then
+  ok "OC gateway registered with Syntex (HTTP 200)"
+else
+  warn "Gateway registration returned HTTP $REGISTRATION_HTTP — check Syntex logs"
+  ERRORS=$((ERRORS + 1))
+fi
 
 # ─── 5. CLONE AND INSTALL SYNTEX MCP ─────────────────────────────────────────
 
@@ -224,7 +231,9 @@ step "Adding syntex-mcp to OC config"
 SX_TOKEN="$SX_TOKEN" SX_GATEWAY_PORT="$GATEWAY_PORT" node - "$OC_CONFIG" << 'NODE_SCRIPT'
 const fs = require('fs');
 
-const configPath  = process.argv[1];
+// process.argv[1] is empty string when node reads from stdin (node -)
+// The first real argument is always at process.argv[2].
+const configPath  = process.argv[2];
 const token       = process.env.SX_TOKEN;
 const gatewayPort = process.env.SX_GATEWAY_PORT;
 
@@ -261,7 +270,8 @@ step "Writing CLAUDE.md to OC workspace"
 OC_WORKSPACE=$(node - "$OC_CONFIG" << 'NODE_SCRIPT'
 const fs  = require('fs');
 let cfg;
-try { cfg = JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); } catch { cfg = {}; }
+// process.argv[1] is empty for stdin scripts — real args start at process.argv[2]
+try { cfg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')); } catch { cfg = {}; }
 // Try known config keys for workspace location
 const ws = cfg.workspace || cfg.workspaceDir || cfg.workDir || '';
 process.stdout.write(ws);
@@ -338,8 +348,6 @@ fi
 # ─── 10. VERIFY AND REPORT ────────────────────────────────────────────────────
 
 step "Verifying installation"
-
-ERRORS=0
 
 # Check OC gateway is listening on port 18789
 if ss -tlnp 2>/dev/null | grep -q ':18789' || \
