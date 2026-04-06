@@ -374,7 +374,7 @@ function buildStructuredTask(soulLine, memoryFacts, task, prefs, tier) {
 //
 // Flow:
 //   GET /api/task/poll  — holds up to 30s; returns { taskId, task } or { task: null }
-//   execute via OC CLI  — openclaw run "<task>"
+//   execute via OC CLI  — openclaw agent --message "<task>" --deliver
 //   POST /api/task/result — { taskId, result }
 //   reconnect immediately regardless of outcome
 
@@ -398,13 +398,21 @@ async function pollForTask() {
 }
 
 async function executeTask(task) {
-  // Submit to OC via CLI. OC runs the task as an agent (with full tool access,
-  // memory, multi-step reasoning) and returns the final output on stdout.
-  // Adjust the subcommand if OC's CLI uses a different verb (e.g. 'chat', 'exec').
-  const { stdout } = await execFileAsync('openclaw', ['run', task], {
-    timeout: 300_000  // 5 min ceiling — OC handles its own internal timeouts
-  });
-  return stdout.trim();
+  // openclaw agent --message "<task>" --deliver
+  //   --message  the task text (passed as a separate arg — execFile never shell-expands it)
+  //   --deliver  non-interactive mode: run once, print result to stdout, exit
+  // Running inside a daemon with no TTY; OC detects the absence of a terminal
+  // and should not attempt interactive prompts when --deliver is set.
+  const { stdout } = await execFileAsync(
+    'openclaw',
+    ['agent', '--message', task, '--deliver'],
+    {
+      timeout:   300_000,         // 5 min ceiling — OC manages its own step timeouts
+      maxBuffer: 10 * 1024 * 1024 // 10 MB — agent responses can be long
+    }
+  );
+  // Strip any residual ANSI codes in case OC's TTY detection misses the daemon context
+  return stdout.trim().replace(/\x1b\[[0-9;]*m/g, '');
 }
 
 async function submitResult(taskId, result) {
