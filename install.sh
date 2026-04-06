@@ -141,10 +141,15 @@ else
 fi
 
 step "Configuring nginx HTTPS reverse proxy on port $GATEWAY_PORT"
+# Write to conf.d/ — included by nginx.conf on every nginx installation.
+# The sites-available/sites-enabled pattern is Debian convention and is not
+# always configured; conf.d/ is universal and avoids silent include failures.
+#
 # Note: bash variables ($GATEWAY_PORT, $SX_TOKEN) are expanded here.
 # nginx variables ($host, $remote_addr, etc.) are escaped with \ so bash
 # leaves them alone and nginx sees the literal $ at runtime.
-cat > /etc/nginx/sites-available/syntex-oc << NGINX_CONF
+mkdir -p /etc/nginx/conf.d
+cat > /etc/nginx/conf.d/syntex-oc.conf << NGINX_CONF
 server {
     listen $GATEWAY_PORT ssl;
     server_name _;
@@ -171,12 +176,10 @@ server {
 }
 NGINX_CONF
 
-ln -sf /etc/nginx/sites-available/syntex-oc /etc/nginx/sites-enabled/syntex-oc
-rm -f /etc/nginx/sites-enabled/default
 nginx -t
 systemctl enable --now nginx
 systemctl reload nginx
-ok "nginx configured on port $GATEWAY_PORT"
+ok "nginx configured on port $GATEWAY_PORT (conf.d/syntex-oc.conf)"
 
 step "Configuring ufw firewall"
 # Allow SSH first so we cannot lock ourselves out.
