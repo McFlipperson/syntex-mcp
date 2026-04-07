@@ -159,19 +159,25 @@ server {
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
-    # Reject any request that does not carry the exact SX token as Bearer auth.
-    # Authentication is via the SX token. TLS provides encryption only.
-    if (\$http_authorization != "Bearer $SX_TOKEN") {
-        return 401;
-    }
+    # Auth: accept SX token via Authorization header (HTTP) or ?token= query
+    # parameter (WebSocket — browsers cannot set Authorization headers for WS).
+    set \$auth_ok "no";
+    if (\$http_authorization = "Bearer $SX_TOKEN") { set \$auth_ok "yes"; }
+    if (\$arg_token = "$SX_TOKEN") { set \$auth_ok "yes"; }
+    if (\$auth_ok != "yes") { return 401; }
 
     location / {
         proxy_pass         http://127.0.0.1:18789;
         proxy_http_version 1.1;
+
+        # WebSocket upgrade support
+        proxy_set_header   Upgrade           \$http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+
         proxy_set_header   Host              \$host;
         proxy_set_header   X-Real-IP         \$remote_addr;
         proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 120s;
+        proxy_read_timeout 300s;
     }
 }
 NGINX_CONF
@@ -204,6 +210,34 @@ if [ "$REGISTRATION_HTTP" = "200" ]; then
   ok "OC gateway registered with Syntex (HTTP 200)"
 else
   warn "Gateway registration returned HTTP $REGISTRATION_HTTP — check Syntex logs"
+  ERRORS=$((ERRORS + 1))
+fi
+
+step "Registering OC gateway token with Syntex"
+# Read the gateway token from openclaw.json (the API key OC uses for WebSocket
+# auth). nginx validates this token for all inbound connections, including WebSocket
+# connections from the modal. Store it in Syntex so the modal can retrieve it.
+OC_GATEWAY_TOKEN=$(node -e "
+  const fs = require('fs');
+  try {
+    const cfg = JSON.parse(fs.readFileSync('$OC_CONFIG', 'utf8'));
+    const tok = cfg.customApiKey || cfg.apiKey || cfg.gatewayToken || cfg.webToken || '';
+    process.stdout.write(tok || '$SX_TOKEN');
+  } catch (e) {
+    process.stdout.write('$SX_TOKEN');
+  }
+" 2>/dev/null || echo "$SX_TOKEN")
+
+GATEWAY_TOKEN_HTTP=$(curl -sS -o /dev/null -w "%{http_code}" \
+  -X POST https://syntexprotocol.com/api/user/oc-gateway-token \
+  -H "Authorization: Bearer $SX_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"gateway_token\":\"$OC_GATEWAY_TOKEN\"}" \
+  --max-time 10)
+if [ "$GATEWAY_TOKEN_HTTP" = "200" ]; then
+  ok "OC gateway token registered with Syntex"
+else
+  warn "Gateway token registration returned HTTP $GATEWAY_TOKEN_HTTP"
   ERRORS=$((ERRORS + 1))
 fi
 
