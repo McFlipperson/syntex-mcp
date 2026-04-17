@@ -140,6 +140,17 @@ else
   ok "Self-signed TLS cert at /etc/nginx/ssl/syntex/"
 fi
 
+step "Generating OC gateway token"
+# Must happen before the nginx config is written — the token is baked into
+# the nginx auth check so the modal can authenticate WebSocket connections.
+# openclaw doctor --generate-gateway-token is idempotent.
+openclaw doctor --generate-gateway-token 2>/dev/null || true
+OC_GATEWAY_TOKEN=$(openclaw config get gateway.auth.token 2>/dev/null || true)
+if [ -z "$OC_GATEWAY_TOKEN" ]; then
+  die "Could not read gateway.auth.token from OC config — cannot configure nginx auth"
+fi
+ok "OC gateway token ready"
+
 step "Configuring nginx HTTPS reverse proxy on port $GATEWAY_PORT"
 # Write to conf.d/ — included by nginx.conf on every nginx installation.
 # The sites-available/sites-enabled pattern is Debian convention and is not
@@ -162,8 +173,8 @@ server {
     # Auth: accept SX token via Authorization header (HTTP) or ?token= query
     # parameter (WebSocket — browsers cannot set Authorization headers for WS).
     set \$auth_ok "no";
-    if (\$http_authorization = "Bearer $SX_TOKEN") { set \$auth_ok "yes"; }
-    if (\$arg_token = "$SX_TOKEN") { set \$auth_ok "yes"; }
+    if (\$http_authorization = "Bearer $OC_GATEWAY_TOKEN") { set \$auth_ok "yes"; }
+    if (\$arg_token = "$OC_GATEWAY_TOKEN")                  { set \$auth_ok "yes"; }
     if (\$auth_ok != "yes") { return 401; }
 
     location / {
@@ -177,7 +188,8 @@ server {
         proxy_set_header   Host              \$host;
         proxy_set_header   X-Real-IP         \$remote_addr;
         proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 300s;
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
     }
 }
 NGINX_CONF
@@ -200,12 +212,7 @@ step "Registering OC gateway with Syntex"
 # POST to /v1/register — Syntex derives the gateway URL from this server's
 # inbound IP + the supplied port, and stores both oc_gateway_url and
 # oc_gateway_token in the user row in one atomic call.
-openclaw doctor --generate-gateway-token 2>/dev/null || true
-OC_GATEWAY_TOKEN=$(openclaw config get gateway.auth.token 2>/dev/null || true)
-if [ -z "$OC_GATEWAY_TOKEN" ]; then
-  warn "Could not read gateway.auth.token from OC config — falling back to SX_TOKEN"
-  OC_GATEWAY_TOKEN="$SX_TOKEN"
-fi
+# OC_GATEWAY_TOKEN was already generated and read in the nginx step above.
 
 REGISTRATION_HTTP=$(curl -sS -o /dev/null -w "%{http_code}" \
   -X POST https://syntexprotocol.com/v1/register \
@@ -269,6 +276,17 @@ config.mcp.servers['syntex-mcp'] = {
   args:    ['/opt/syntex-mcp/src/index.js'],
   env:     { SX_TOKEN: token }
 };
+
+// Allow the Syntex modal to connect via WebSocket
+if (!config.gateway)            config.gateway           = {};
+if (!config.gateway.controlUi)  config.gateway.controlUi = {};
+config.gateway.controlUi.allowInsecureAuth          = true;
+config.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
+config.gateway.controlUi.allowedOrigins             = ['https://syntexprotocol.com'];
+
+// Enable coding tools so OC can read/write workspace files
+if (!config.tools) config.tools = {};
+config.tools.profile = 'coding';
 
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
 process.stdout.write('syntex-mcp entry written to OC config\n');
